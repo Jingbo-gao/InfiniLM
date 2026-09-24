@@ -111,7 +111,24 @@ QKVParallelLinear::QKVParallelLinear(size_t hidden_size,
 }
 
 void QKVParallelLinear::process_weights_after_loading() {
+    // Split first, while the weight is still in the checkpoint [OC, IC]
+    // layout: the split_infos_ offsets are only valid there, and narrow
+    // must not run on the converted [IC, OC] / FRACTAL_NZ weight.
+    if (register_fn_ && !split_infos_.empty()) {
+        auto params = this->split_params(split_infos_, tp_rank_, tp_size_, num_k_head_);
+        for (auto &sp : params) {
+            register_fn_(sp.full_name, std::move(sp.param));
+        }
+    }
+
+    // Then convert: pre-transpose and optional FRACTAL_NZ cast.
     BaseLinear::process_weights_after_loading();
+
+    // Re-split against the converted weight so the sub-parameter views stop
+    // pinning the old [OC, IC] storage (otherwise device memory stays
+    // doubled and tp=4 OOMs on FM9G-70B). The weight is [IC, OC] now;
+    // split_params flips the narrow dim based on the recorded weight
+    // layout. The refreshed views are not consumed by the inference path.
     if (register_fn_ && !split_infos_.empty()) {
         auto params = this->split_params(split_infos_, tp_rank_, tp_size_, num_k_head_);
         for (auto &sp : params) {
@@ -185,7 +202,24 @@ GateUpParallelLinear::GateUpParallelLinear(size_t hidden_size, size_t intermedia
 }
 
 void GateUpParallelLinear::process_weights_after_loading() {
+    // Split first, while the weight is still in the checkpoint [OC, IC]
+    // layout: the split_infos_ offsets are only valid there, and narrow
+    // must not run on the converted [IC, OC] / FRACTAL_NZ weight.
+    if (register_fn_ && !split_infos_.empty()) {
+        auto params = this->split_params(split_infos_, tp_rank_, tp_size_, -1);
+        for (auto &sp : params) {
+            register_fn_(sp.full_name, std::move(sp.param));
+        }
+    }
+
+    // Then convert: pre-transpose and optional FRACTAL_NZ cast.
     BaseLinear::process_weights_after_loading();
+
+    // Re-split against the converted weight so the sub-parameter views stop
+    // pinning the old [OC, IC] storage (otherwise device memory stays
+    // doubled and tp=4 OOMs on FM9G-70B). The weight is [IC, OC] now;
+    // split_params flips the narrow dim based on the recorded weight
+    // layout. The refreshed views are not consumed by the inference path.
     if (register_fn_ && !split_infos_.empty()) {
         auto params = this->split_params(split_infos_, tp_rank_, tp_size_, -1);
         for (auto &sp : params) {
