@@ -33,27 +33,11 @@ PagedCompiler::PagedCompiler(const std::shared_ptr<InfinilmModel> &model, RankBa
         return;
     }
     const size_t max_batch_size = paged_config->max_batch_size();
-    auto append_batch_size = [&](size_t batch_size) {
-        if (batch_size <= max_batch_size) {
-            decode_batch_sizes_.push_back(batch_size);
-        }
-    };
-
-    for (size_t b = 1; b < 64; ++b) {
-        append_batch_size(b);
-    }
-    for (size_t b = 64; b < 128; b += 16) {
-        append_batch_size(b);
-    }
-    for (size_t b = 128; b < 256; b += 32) {
-        append_batch_size(b);
-    }
-    for (size_t b = 256; b <= 512; b += 64) {
-        append_batch_size(b);
-    }
-    if (decode_batch_sizes_.empty() || decode_batch_sizes_.back() != max_batch_size) {
-        decode_batch_sizes_.push_back(max_batch_size);
-    }
+    // Capture a single decode graph at the configured max batch size; smaller
+    // batches fall back to eager. Capturing the full 1..max sweep exhausts
+    // HBM on large models (e.g. 70B TP8), while the max-batch graph covers
+    // the capacity-bound decode step.
+    decode_batch_sizes_.push_back(max_batch_size);
 }
 
 void PagedCompiler::compile() {
