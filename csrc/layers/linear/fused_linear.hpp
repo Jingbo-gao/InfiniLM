@@ -54,6 +54,11 @@ public:
     std::tuple<infinicore::Tensor, infinicore::Tensor, infinicore::Tensor>
     forward_split(infinicore::Tensor &input);
 
+    // Like forward_split, but also returns a merged [*, q_out+k_out]
+    // view so callers can RoPE q+k in a single kernel launch.
+    std::tuple<infinicore::Tensor, infinicore::Tensor, infinicore::Tensor, infinicore::Tensor>
+    forward_split_with_qk(infinicore::Tensor &input);
+
     bool has_q_bias() const;
     bool has_k_bias() const;
     bool has_v_bias() const;
