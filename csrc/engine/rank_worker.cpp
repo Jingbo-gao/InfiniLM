@@ -3,6 +3,7 @@
 #include "infinicore/ops.hpp"
 #include "infinicore/ops/distributed/send_recv.hpp"
 #include <spdlog/spdlog.h>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace infinilm::engine {
@@ -482,18 +483,36 @@ void RankWorker::thread_loop() {
                             const size_t logits_positions = batch_size * total_len;
                             const bool logits_are_last_token_only = !sample_all_positions && logits_positions == n_req;
                             const size_t n_out = sample_all_positions ? static_cast<size_t>(input_offsets[n_req]) : n_req;
-                            auto output_ids{infinicore::Tensor::empty({n_out}, infinicore::DataType::I64, rank_info_.device)};
 
-                            for (size_t i{0}; i < n_out; ++i) {
-                                size_t score_idx = i;
-                                if (!sample_all_positions && !logits_are_last_token_only) {
-                                    score_idx = static_cast<size_t>(input_offsets[i + 1] - 1);
+                            // The generic Ascend sampler stages one full vocab
+                            // row per request on the host and synchronizes the
+                            // stream for every row. Decode with top_k <= 1 is
+                            // greedy, so one device-side argmax over the whole
+                            // batch is equivalent and avoids |batch| D2H syncs.
+                            infinicore::Tensor output_ids;
+                            const bool greedy_sample =
+                                top_k <= 1 || temperature == 0.0f || top_p == 0.0f;
+                            if (greedy_sample && logits_are_last_token_only
+                                && logits->is_contiguous()
+                                && logits->device().getType()
+                                       == infinicore::Device::Type::ASCEND) {
+                                output_ids = infinicore::op::argmax(
+                                    logits->view({n_out, vocab_size}), 1);
+                            } else {
+                                output_ids = infinicore::Tensor::empty(
+                                    {n_out}, infinicore::DataType::I64,
+                                    rank_info_.device);
+                                for (size_t i{0}; i < n_out; ++i) {
+                                    size_t score_idx = i;
+                                    if (!sample_all_positions && !logits_are_last_token_only) {
+                                        score_idx = static_cast<size_t>(input_offsets[i + 1] - 1);
+                                    }
+                                    auto score{logits->view({logits_positions, vocab_size})->narrow({{0, score_idx, 1}})->view({vocab_size})};
+                                    auto out{output_ids->narrow({{0, i, 1}})->view({})};
+                                    float random_val = std::uniform_real_distribution<float>(0, 1)(rng_);
+                                    infinicore::op::random_sample_(
+                                        out, score, random_val, top_p, top_k, temperature);
                                 }
-                                auto score{logits->view({logits_positions, vocab_size})->narrow({{0, score_idx, 1}})->view({vocab_size})};
-                                auto out{output_ids->narrow({{0, i, 1}})->view({})};
-                                float random_val = std::uniform_real_distribution<float>(0, 1)(rng_);
-                                infinicore::op::random_sample_(
-                                    out, score, random_val, top_p, top_k, temperature);
                             }
 
                             if (rank_info_.pp_size > 1) {
@@ -503,6 +522,14 @@ void RankWorker::thread_loop() {
                                     rank_info_.world_comm);
                             }
 
+                            // The aclnn sampling ops (cast/argmax) are enqueued on the
+                            // compute stream and may still be in flight when this
+                            // worker returns. aclrtMemcpy does NOT wait for those
+                            // aclnn tasks, so without a sync first the D2H copy
+                            // reads the PREVIOUS step's token (stale buffer) and
+                            // decode output repeats forever. Sync the stream first,
+                            // then copy, then sync again for the host read.
+                            infinicore::context::syncStream();
                             output_ids = output_ids->to(infinicore::Device::cpu());
 
                             infinicore::context::syncStream();
