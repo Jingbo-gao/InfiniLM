@@ -47,8 +47,10 @@ infinicore::Tensor NoneQuantization::forward(
 
     const auto layout = weight_layout(weight);
     if (layout == WeightLayout::ASCEND_NZ_KN) {
-        return infinicore::op::linear_packed_nz(
-            input_contiguous, weight, bias_opt, alpha);
+        return narrow_nz_output(
+            infinicore::op::linear_packed_nz(
+                input_contiguous, weight, bias_opt, alpha),
+            weight);
     }
     if (layout == WeightLayout::ND_KN) {
         return infinicore::op::linear_packed(input_contiguous, weight, bias_opt, alpha);
@@ -78,8 +80,10 @@ infinicore::Tensor NoneQuantization::forward_allreduce(
 
     const auto layout = weight_layout(weight);
     if (layout == WeightLayout::ASCEND_NZ_KN) {
-        return infinicore::op::linear_allreduce_packed_nz(
-            input_contiguous, weight, bias_opt, communicator);
+        return narrow_nz_output(
+            infinicore::op::linear_allreduce_packed_nz(
+                input_contiguous, weight, bias_opt, communicator),
+            weight);
     }
     if (layout == WeightLayout::ND_KN) {
         return infinicore::op::linear_allreduce_packed(
@@ -87,6 +91,21 @@ infinicore::Tensor NoneQuantization::forward_allreduce(
     }
     return infinicore::op::linear_allreduce(
         input_contiguous, weight->contiguous(), bias_opt, communicator);
+}
+
+infinicore::Tensor NoneQuantization::narrow_nz_output(
+    const infinicore::Tensor &out,
+    const infinicore::Tensor &weight) const {
+    std::lock_guard<std::mutex> lock(weight_layouts_mutex_);
+    auto it = nz_pad_n_.find(weight.operator->());
+    if (it == nz_pad_n_.end() || it->second == weight->shape()[1]) {
+        return out;
+    }
+    // The padded-FRACTAL_NZ GEMM produces [..., padded_N]. Slice back to the
+    // real output width and materialize a contiguous tensor so downstream
+    // sampling (the greedy device argmax fast path requires is_contiguous())
+    // sees exactly the same shape and values as the plain ND path.
+    return out->narrow({{out->ndim() - 1, 0, it->second}})->contiguous();
 }
 
 std::vector<SplitParam> NoneQuantization::split_params(
@@ -149,22 +168,57 @@ std::shared_ptr<BaseQuantization> NoneQuantization::process_weights_after_loadin
 
         const bool nz_eligible =
             device.getType() == infinicore::Device::Type::ASCEND
-            // Row-parallel layers use the fused MatmulAllReduce API, which has
-            // no WeightNz variant in the installed CANN headers. Keep that
-            // path on ND. Bias is supported by linear_packed_nz_ as
-            // MatmulWeightNz followed by an Ascend in-place broadcast add.
-            && split_dim != 1
+            // FRACTAL_NZ weights are now supported on both the plain
+            // MatMul + HCCL AllReduce path (gemm_nz_) and the fused
+            // MatmulAllReduce NZ variant, so row-parallel layers can use NZ
+            // as well. Previously they were forced onto ND because the NZ
+            // fused variant was missing.
             && packed_nd->ndim() == 2
             && (packed_nd->dtype() == infinicore::DataType::F16
                 || packed_nd->dtype() == infinicore::DataType::BF16)
             && packed_nd->size(0) % 16 == 0
             && packed_nd->size(1) % 16 == 0;
 
+        const size_t packed_k = packed_nd->size(0);
+        const size_t packed_n = packed_nd->size(1);
+        // lm_head-like replicated, bias-free weights whose output width is not
+        // a multiple of 16 (e.g. vocab 73448). aclnnGemm would otherwise
+        // re-run a ~2.7ms ND->NZ TransData on the 1.2GB weight every decode
+        // step; pre-converting a 16-padded NZ copy once at load time removes
+        // it from the hot path (the padded output columns are sliced away in
+        // narrow_nz_output, so they never reach sampling).
+        const bool nz_pad_eligible =
+            device.getType() == infinicore::Device::Type::ASCEND
+            && packed_nd->ndim() == 2
+            && (packed_nd->dtype() == infinicore::DataType::F16
+                || packed_nd->dtype() == infinicore::DataType::BF16)
+            && packed_k % 16 == 0
+            && packed_n % 16 != 0
+            // Replicated, bias-free layers only: split/column-parallel layers
+            // feed forward_allreduce (which must keep ND_KN) and a padded
+            // bias would need its own padding handling.
+            && split_dim < 0
+            && params.find("bias") == params.end();
+
         if (nz_eligible) {
             params["weight"] = infinicore::op::ascend_format_cast_nz(packed_nd);
             std::lock_guard<std::mutex> lock(weight_layouts_mutex_);
             weight_layouts_[params["weight"].operator->()] =
                 WeightLayout::ASCEND_NZ_KN;
+        } else if (nz_pad_eligible) {
+            const size_t n_pad = (packed_n + 15) / 16 * 16;
+            auto padded = infinicore::Tensor::empty(
+                {packed_k, n_pad}, packed_nd->dtype(), device);
+            // Copy the real [K, N] block into the padded buffer. The pad
+            // region (right of column N) is never read by forward: it only
+            // affects the GEMM's padded output columns, which
+            // narrow_nz_output slices away, so it need not be zeroed.
+            padded->narrow({{1, 0, packed_n}})->copy_from(packed_nd);
+            params["weight"] = infinicore::op::ascend_format_cast_nz(padded);
+            std::lock_guard<std::mutex> lock(weight_layouts_mutex_);
+            weight_layouts_[params["weight"].operator->()] =
+                WeightLayout::ASCEND_NZ_KN;
+            nz_pad_n_[params["weight"].operator->()] = packed_n;
         } else {
             params["weight"] = packed_nd;
             std::lock_guard<std::mutex> lock(weight_layouts_mutex_);

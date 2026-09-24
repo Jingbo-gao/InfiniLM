@@ -1,5 +1,6 @@
 #include "infer_engine.hpp"
 #include "../config/config_factory.hpp"
+#include "infinicore/graph/graph.hpp"
 #include "spdlog/spdlog.h"
 #include <algorithm>
 #include <cstdint>
@@ -255,6 +256,29 @@ InferEngine::Input::to_model_input(infinicore::Device device) const {
         input.slot_mapping,
         max_query_length,
         max_sequence_length};
+
+    // Ascend FlashAttention needs these small arrays on the host. They are
+    // identical for every transformer layer in one forward, so bind the
+    // original CPU values once instead of doing synchronous D2H copies in
+    // every attention layer.
+    infinicore::graph::clear_eager_host_int_arrays();
+    auto bind_host_i32 = [](
+                             const std::optional<infinicore::Tensor> &host,
+                             const std::optional<infinicore::Tensor> &device) {
+        if (!host || !device
+            || host.value()->device().getType()
+                   != infinicore::Device::Type::CPU
+            || host.value()->dtype() != infinicore::DataType::I32) {
+            return;
+        }
+        infinicore::graph::bind_eager_host_int_array(
+            device.value(),
+            reinterpret_cast<const int32_t *>(host.value()->data()),
+            host.value()->numel());
+    };
+    bind_host_i32(input_offsets, input.input_offsets);
+    bind_host_i32(cu_seqlens, input.cu_seqlens);
+    bind_host_i32(total_sequence_lengths, input.total_sequence_lengths);
 
     infinilm::global_state::get_forward_context().mamba_metadata = {
         input.input_offsets,
