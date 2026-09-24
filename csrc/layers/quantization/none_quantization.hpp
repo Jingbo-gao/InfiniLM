@@ -1,6 +1,8 @@
 #pragma once
 
 #include "base_quantization.hpp"
+#include <mutex>
+#include <unordered_map>
 namespace infinilm::quantization {
 
 class NoneQuantization : public BaseQuantization {
@@ -40,15 +42,38 @@ public:
         int narrow_dim,
         int tp_rank, int tp_size, int tp_num_heads) const override;
 
-    // Ascend: pre-pack weight to [IC, OC] after loading to skip runtime permute.
-    // Returns shared_from_this() only on Ascend; nullptr otherwise (no-op).
+    // With --pre-transpose, materialize [IC, OC] once. Eligible Ascend FP16/BF16
+    // weights are then converted to FRACTAL_NZ; all other devices retain ND.
     std::shared_ptr<BaseQuantization> process_weights_after_loading(
         ParamsMap &params,
         const infinicore::Device &device,
         int split_dim = -1) const override;
 
 private:
-    mutable bool weight_prepacked_ = false; // true when weight was pre-packed for Ascend
+    enum class WeightLayout {
+        NONE,          // checkpoint layout [OC, IC]
+        ND_KN,         // pre-transposed contiguous [IC, OC]
+        ASCEND_NZ_KN,  // logical [IC, OC], physical FRACTAL_NZ
+    };
+
+    WeightLayout weight_layout(const infinicore::Tensor &weight) const;
+
+    // For weights converted to padded FRACTAL_NZ (real output width N not a
+    // multiple of 16, padded to N_pad at load time), narrow the GEMM output
+    // back to the real width so downstream sampling never sees padded columns.
+    infinicore::Tensor narrow_nz_output(
+        const infinicore::Tensor &out,
+        const infinicore::Tensor &weight) const;
+
+    // NoneQuantization is shared by multiple Linear layers. Layout therefore
+    // belongs to the transformed weight tensor, not to this quantizer object.
+    mutable std::mutex weight_layouts_mutex_;
+    mutable std::unordered_map<const infinicore::TensorImpl *, WeightLayout>
+        weight_layouts_;
+    // Real output width N for padded-FRACTAL_NZ weights (keyed by the same
+    // weight tensor pointer as weight_layouts_).
+    mutable std::unordered_map<const infinicore::TensorImpl *, size_t>
+        nz_pad_n_;
 };
 
 } // namespace infinilm::quantization
