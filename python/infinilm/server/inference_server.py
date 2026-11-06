@@ -108,7 +108,7 @@ class InferenceServer:
         cache_type: str = "paged",
         max_tokens: int = 4096,
         max_batch_size: int = 16,
-        num_blocks: int = 512,
+        num_blocks: int = 512,  # 对 70B 级模型过大, 见 _log_kv_pool_budget
         block_size: int = 256,
         max_cache_len: int = 4096,
         temperature: float = 1.0,
@@ -198,11 +198,50 @@ class InferenceServer:
         uvicorn.run(app, host=self.host, port=self.port)
         logger.info("Inference Server stopped")
 
+    def _log_kv_pool_budget(self):
+        """按 config.json 估算 paged KV 池大小并打日志.
+
+        默认 512 块在 70B 级模型上启动即 OOM(aclrtMalloc 207001),
+        提前把数字给到操作的人.
+        """
+        if self.cache_type != "paged":
+            return
+        try:
+            import json
+
+            with open(os.path.join(self.model_path, "config.json"), "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            num_heads = cfg.get("num_attention_heads")
+            num_kv_heads = cfg.get("num_key_value_heads") or num_heads
+            num_layers = cfg.get("num_hidden_layers")
+            hidden = cfg.get("hidden_size")
+            if not all((num_heads, num_kv_heads, num_layers, hidden)):
+                return
+            head_dim = hidden // num_heads
+            dtype_bytes = 2 if self.dtype in ("float16", "bfloat16") else 4
+            tp = max(self.tensor_parallel_size, 1)
+            per_token = 2 * (num_kv_heads / tp) * head_dim * dtype_bytes * num_layers
+            total_bytes = per_token * self.num_blocks * self.block_size
+            logger.info(
+                f"Paged KV pool: {self.num_blocks} blocks x {self.block_size} tokens "
+                f"~= {per_token / 1e6:.2f} MB/token/card, {total_bytes / 1e9:.1f} GB/card total "
+                f"(TP{tp}, dtype={self.dtype})"
+            )
+            if total_bytes > 64e9:
+                logger.warning(
+                    f"Paged KV pool (~{total_bytes / 1e9:.1f} GB/card) probably exceeds "
+                    f"device memory, consider a smaller --num-blocks"
+                )
+        except Exception:
+            # Estimation is best-effort; never block server startup.
+            pass
+
     def _create_app(self):
         """Create FastAPI application."""
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
+            self._log_kv_pool_budget()
             self.engine = AsyncLLMEngine(
                 model_path=self.model_path,
                 device=self.device,
